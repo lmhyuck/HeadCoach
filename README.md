@@ -63,13 +63,9 @@ npm run dev
 
 구체적인 선수·포메이션 설계는 `docs/04-선수·포메이션-설계.md`에서 확인할 수 있습니다.
 
-## 제출 전 반드시 할 일
+[스쿼드 화면]
+<img width="1392" height="1153" alt="image" src="https://github.com/user-attachments/assets/bcedca0b-91d0-4a29-9b17-a9694c5e679a" />
 
-- 실제 명단의 출처·이용 조건·수집일 및 `DATA · METHOD` 표기를 제출 직전에 재확인 (`docs/06`, `docs/08` 참고)
-- `docs/02-최종제출-체크리스트.md`의 세 URL을 실제 링크로 교체
-- 배포 URL을 로그아웃·시크릿 창에서 점검
-- `scripts/generate_planning_pdf.py`를 다시 실행해 PDF의 팀명·링크를 확정
-- 최종 제출 시각 이후 GitHub에 커밋하지 않도록 배포와 저장소를 동결
 
 ## 라이선스
 
