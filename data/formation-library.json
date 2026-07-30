@@ -1,0 +1,404 @@
+{
+  "attributeLabels": {
+    "pace": "속도",
+    "shooting": "슈팅",
+    "passing": "패스",
+    "dribbling": "드리블",
+    "defense": "수비",
+    "physical": "피지컬",
+    "positioning": "위치 선정"
+  },
+  "formations": [
+    {
+      "id": "4-3-3",
+      "label": "4-3-3 균형형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RCM",
+        "CM",
+        "LCM",
+        "RW",
+        "ST",
+        "LW"
+      ]
+    },
+    {
+      "id": "4-3-3-false-9",
+      "label": "4-3-3 CF 연계형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RCM",
+        "CM",
+        "LCM",
+        "RW",
+        "CF",
+        "LW"
+      ]
+    },
+    {
+      "id": "4-3-3-holding",
+      "label": "4-3-3 홀딩",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "CDM",
+        "RCM",
+        "LCM",
+        "RW",
+        "ST",
+        "LW"
+      ]
+    },
+    {
+      "id": "4-3-3-attack",
+      "label": "4-3-3 CAM 공격형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RCM",
+        "CAM",
+        "LCM",
+        "RW",
+        "ST",
+        "LW"
+      ]
+    },
+    {
+      "id": "4-2-2-2",
+      "label": "4-2-2-2 박스",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RDM",
+        "LDM",
+        "RAM",
+        "LAM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "4-3-2-1",
+      "label": "4-3-2-1 크리스마스 트리",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RCM",
+        "CM",
+        "LCM",
+        "RAM",
+        "LAM",
+        "ST"
+      ]
+    },
+    {
+      "id": "4-4-1-1",
+      "label": "4-4-1-1 세컨드 스트라이커",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RM",
+        "RCM",
+        "LCM",
+        "LM",
+        "CF",
+        "ST"
+      ]
+    },
+    {
+      "id": "4-4-2-holding",
+      "label": "4-4-2 홀딩",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RM",
+        "RDM",
+        "LDM",
+        "LM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "4-1-2-1-2",
+      "label": "4-1-2-1-2 다이아몬드",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "CDM",
+        "RCM",
+        "LCM",
+        "CAM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "4-5-1",
+      "label": "4-5-1 미드필드 장악",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RM",
+        "RCM",
+        "CM",
+        "LCM",
+        "LM",
+        "ST"
+      ]
+    },
+    {
+      "id": "4-2-4",
+      "label": "4-2-4 초공격",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RDM",
+        "LDM",
+        "RW",
+        "LW",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "3-5-2",
+      "label": "3-5-2 중앙 장악",
+      "slots": [
+        "GK",
+        "RCB",
+        "CB",
+        "LCB",
+        "RWB",
+        "CDM",
+        "RCM",
+        "LCM",
+        "LWB",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "3-4-2-1",
+      "label": "3-4-2-1 트리",
+      "slots": [
+        "GK",
+        "RCB",
+        "CB",
+        "LCB",
+        "RWB",
+        "RCM",
+        "LCM",
+        "LWB",
+        "RAM",
+        "LAM",
+        "ST"
+      ]
+    },
+    {
+      "id": "3-4-1-2",
+      "label": "3-4-1-2 중앙형",
+      "slots": [
+        "GK",
+        "RCB",
+        "CB",
+        "LCB",
+        "RWB",
+        "RCM",
+        "LCM",
+        "LWB",
+        "CAM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "5-2-1-2",
+      "label": "5-2-1-2 수비 전환",
+      "slots": [
+        "GK",
+        "RWB",
+        "RCB",
+        "CB",
+        "LCB",
+        "LWB",
+        "RCM",
+        "LCM",
+        "CAM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "5-2-2-1",
+      "label": "5-2-2-1 윙 전개",
+      "slots": [
+        "GK",
+        "RWB",
+        "RCB",
+        "CB",
+        "LCB",
+        "LWB",
+        "RCM",
+        "LCM",
+        "RAM",
+        "LAM",
+        "ST"
+      ]
+    },
+    {
+      "id": "5-4-1",
+      "label": "5-4-1 로우 블록",
+      "slots": [
+        "GK",
+        "RWB",
+        "RCB",
+        "CB",
+        "LCB",
+        "LWB",
+        "RM",
+        "RCM",
+        "LCM",
+        "LM",
+        "ST"
+      ]
+    },
+    {
+      "id": "4-2-3-1",
+      "label": "4-2-3-1 안정형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RDM",
+        "LDM",
+        "RAM",
+        "CAM",
+        "LAM",
+        "ST"
+      ]
+    },
+    {
+      "id": "3-4-3",
+      "label": "3-4-3 압박형",
+      "slots": [
+        "GK",
+        "RCB",
+        "CB",
+        "LCB",
+        "RWB",
+        "RCM",
+        "LCM",
+        "LWB",
+        "RW",
+        "ST",
+        "LW"
+      ]
+    },
+    {
+      "id": "4-4-2",
+      "label": "4-4-2 투톱형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RM",
+        "RCM",
+        "LCM",
+        "LM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "4-1-4-1",
+      "label": "4-1-4-1 밸런스형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "CDM",
+        "RM",
+        "RCM",
+        "LCM",
+        "LM",
+        "ST"
+      ]
+    },
+    {
+      "id": "5-3-2",
+      "label": "5-3-2 수비 전환형",
+      "slots": [
+        "GK",
+        "RWB",
+        "RCB",
+        "CB",
+        "LCB",
+        "LWB",
+        "RCM",
+        "CM",
+        "LCM",
+        "RST",
+        "LST"
+      ]
+    },
+    {
+      "id": "4-3-1-2",
+      "label": "4-3-1-2 중앙 장악형",
+      "slots": [
+        "GK",
+        "RB",
+        "RCB",
+        "LCB",
+        "LB",
+        "RCM",
+        "CM",
+        "LCM",
+        "CAM",
+        "RST",
+        "LST"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "tactica-2026-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "월드컵 전술 웹서비스 챌린지용 인터랙션 MVP",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "data:build": "node scripts/build_world_cup_32_data.mjs"
+  }
+}
