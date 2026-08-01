@@ -182,22 +182,11 @@ const state = {
 };
 
 const WORKSPACE_DRAFT_KEY = "tactica-2026-workspace-v2";
-const THEME_PREFERENCE_KEY = "tactica-2026-theme";
 
-function applyTheme(theme) {
-  state.theme = theme === "light" ? "light" : "dark";
-  document.documentElement?.setAttribute("data-theme", state.theme);
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", state.theme === "light" ? "#f4f7fb" : "#071d1a");
-  try {
-    window.localStorage.setItem(THEME_PREFERENCE_KEY, state.theme);
-  } catch (_) {
-    // Theme preference is optional and must not block the tactical board.
-  }
-}
-
-function toggleTheme() {
-  applyTheme(state.theme === "dark" ? "light" : "dark");
-  render();
+function applyDarkTheme() {
+  state.theme = "dark";
+  document.documentElement?.setAttribute("data-theme", "dark");
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", "#071d1a");
 }
 
 function normalizeTactics(candidate, fallback = DEFAULT_TACTICS) {
@@ -269,7 +258,6 @@ function persistWorkspaceDraft() {
       freePositions: state.freePositions,
       tactics: state.tactics,
       savedPlans: state.savedPlans,
-      theme: state.theme,
       activeTab: state.activeTab,
       squadDensity: state.squadDensity,
       squadFilter: state.squadFilter
@@ -294,7 +282,6 @@ function restoreWorkspaceDraft() {
     state.freePositions = sanitizedFreePositions(draft.freePositions, homeIds);
     state.tactics = normalizeTactics(draft.tactics, state.tactics);
     state.savedPlans = Array.isArray(draft.savedPlans) ? draft.savedPlans.slice(0, 2) : [];
-    if (["dark", "light"].includes(draft.theme)) state.theme = draft.theme;
     state.activeTab = draft.activeTab === "bench" ? "bench" : "starters";
     state.squadDensity = draft.squadDensity === "dense" ? "dense" : "detail";
     state.squadFilter = ["all", "attack", "midfield", "defense", "goalkeeper"].includes(draft.squadFilter) ? draft.squadFilter : "all";
@@ -1484,13 +1471,7 @@ function renderHeaderBase() {
 }
 
 function renderHeader() {
-  const nextTheme = state.theme === "dark" ? "light" : "dark";
-  const label = state.theme === "dark" ? "LIGHT" : "DARK";
-  const icon = state.theme === "dark" ? "☀" : "◐";
-  return renderHeaderBase().replace(
-    '<div class="topbar-actions">',
-    `<div class="topbar-actions"><button class="theme-toggle" data-theme-toggle aria-label="${nextTheme} mode로 전환" title="${nextTheme} mode로 전환"><i>${icon}</i><span>${label}</span></button>`
-  );
+  return renderHeaderBase();
 }
 
 function renderMethodologyModal() {
@@ -2471,7 +2452,7 @@ function renderSavedPlans() {
 }
 
 function render() {
-  document.documentElement?.setAttribute("data-theme", state.theme);
+  applyDarkTheme();
   if (!state.data) {
     app.innerHTML = `<main class="loading"><div class="loading-mark">T</div><p>전술 보드를 준비하고 있습니다.</p></main>`;
     return;
@@ -2508,7 +2489,6 @@ function bindInteractions() {
   document.querySelector("#simulate-button")?.addEventListener("click", () => { runSimulation(); document.querySelector(".results")?.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
   document.querySelector("[data-share-config]")?.addEventListener("click", copyShareLink);
   document.querySelector("[data-open-methodology]")?.addEventListener("click", () => { state.methodologyOpen = true; render(); });
-  document.querySelector("[data-theme-toggle]")?.addEventListener("click", toggleTheme);
   document.querySelectorAll("[data-close-methodology]").forEach((element) => element.addEventListener("click", () => { state.methodologyOpen = false; render(); }));
   document.querySelector("[data-methodology-backdrop]")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) { state.methodologyOpen = false; render(); } });
   document.querySelector("[data-open-dataset-import]")?.addEventListener("click", () => document.querySelector("#dataset-import")?.click());
@@ -2578,8 +2558,7 @@ function bindInteractions() {
 
 async function init() {
   try {
-    const storedTheme = window.localStorage.getItem(THEME_PREFERENCE_KEY);
-    if (["dark", "light"].includes(storedTheme)) applyTheme(storedTheme);
+    applyDarkTheme();
     const response = await fetch("data/world-cup-2026.json");
     if (!response.ok) throw new Error("데이터를 불러오지 못했습니다.");
     state.data = await response.json();
