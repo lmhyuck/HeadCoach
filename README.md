@@ -67,7 +67,7 @@ npm run dev
 
 ## 스쿼드 화면
 
-<img width="1392" height="1153" alt="스쿼드 화면" src="https://github.com/user-attachments/assets/bcedca0b-91d0-4a29-9b17-a9694c5e679a" />
+<img width="774" height="1016" alt="image" src="https://github.com/user-attachments/assets/ab88840f-85a4-4e3c-ac37-1d3faa0f381e" />
 
 
 ## 라이선스
