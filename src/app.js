@@ -151,6 +151,15 @@ const TACTIC_OPTIONS = Object.freeze({
   buildUp: ["possession", "mixed", "direct"]
 });
 
+// The engine is calculated in six 15-minute phases.  These are deliberately
+// kept separate from the phase starts so a coach can intervene at the end of
+// every completed phase, but never has to stop the final whistle at 90'.
+const COACH_CHECKPOINT_MINUTES = Object.freeze([15, 30, 45, 60, 75]);
+// Each 15-minute phase is composed from two or three distinct incidents.
+// Five seconds per incident keeps the flow readable without turning a single
+// action into artificial slow motion.
+const PLAYBACK_EVENT_DURATION = 5000;
+
 const state = {
   data: null,
   scenarioId: null,
@@ -915,18 +924,140 @@ function signedValue(value, digits = 0) {
   return `${rounded > 0 ? "+" : ""}${rounded.toFixed(digits)}`;
 }
 
-function decisionOptionBlueprints() {
+function checkpointUnitForSlot(slot) {
+  const position = basePosition(slot);
+  if (["ST", "RW", "LW", "AM"].includes(position)) return "attack";
+  if (["DM", "CM"].includes(position)) return "midfield";
+  return "defense";
+}
+
+function checkpointUnitMeta(unit) {
+  return {
+    attack: { label: "공격 라인", keys: ["pace", "shooting", "dribbling", "positioning"] },
+    midfield: { label: "중원 라인", keys: ["passing", "dribbling", "defense", "positioning"] },
+    defense: { label: "수비 라인", keys: ["defense", "physical", "pace", "positioning"] }
+  }[unit];
+}
+
+function checkpointPlayerScore(playerData, slot, stamina) {
+  if (!playerData) return 0;
+  const meta = checkpointUnitMeta(checkpointUnitForSlot(slot));
+  const attributeScore = average(meta.keys.map((key) => playerData.attributes[key] || 0));
+  const fitness = clamp((stamina ?? playerState(playerData, state.scenarioId).stamina) / 100, .58, 1);
+  const fit = clamp(positionFit(playerData, slot) / 100, .72, 1);
+  return Math.round(clamp(attributeScore * fitness * fit, 25, 99));
+}
+
+function checkpointSideForSlot(slot) {
+  if (slot.startsWith("L")) return "좌측";
+  if (slot.startsWith("R")) return "우측";
+  return "중앙";
+}
+
+function buildCheckpointAnalysis(result, minute) {
+  const phase = result?.phaseMetrics?.find((item) => item.minute >= minute) || result?.phaseMetrics?.at(-1);
+  const stats = result?.phaseStats?.find((item) => item.end >= minute) || result?.phaseStats?.at(-1);
+  const staminaById = Object.fromEntries(liveStaminaSnapshot(result, minute).map((item) => [item.id, item.stamina]));
+  const playerEntries = Object.entries(state.lineup)
+    .map(([slot, id]) => {
+      const item = player(id);
+      const stamina = staminaById[id] ?? playerState(item, state.scenarioId).stamina;
+      return item ? { item, slot, stamina, score: checkpointPlayerScore(item, slot, stamina), unit: checkpointUnitForSlot(slot), side: checkpointSideForSlot(slot) } : null;
+    })
+    .filter(Boolean);
+  const units = ["attack", "midfield", "defense"].map((unit) => {
+    const members = playerEntries.filter((entry) => entry.unit === unit);
+    const leader = [...members].sort((a, b) => b.score - a.score)[0];
+    const concern = [...members].sort((a, b) => a.score - b.score)[0];
+    return {
+      id: unit,
+      ...checkpointUnitMeta(unit),
+      score: Math.round(average(members.map((entry) => entry.score)) || 0),
+      members,
+      leader,
+      concern,
+      slots: members.map((entry) => entry.slot).join(" · ") || "배치 없음"
+    };
+  });
+  const strongest = [...units].sort((a, b) => b.score - a.score)[0];
+  const weakest = [...units].sort((a, b) => a.score - b.score)[0];
+  const strongestPlayer = [...playerEntries].sort((a, b) => b.score - a.score)[0];
+  const weakestPlayer = [...playerEntries].sort((a, b) => a.score - b.score)[0];
+  const sides = ["좌측", "중앙", "우측"].map((side) => {
+    const members = playerEntries.filter((entry) => entry.side === side);
+    return { side, score: Math.round(average(members.map((entry) => entry.score)) || 0), members };
+  }).filter((entry) => entry.members.length);
+  const vulnerableSide = [...sides].sort((a, b) => a.score - b.score)[0];
+  const homeShots = stats?.shotsHome || 0;
+  const awayShots = stats?.shotsAway || 0;
+  const homeXg = stats?.xgHome || 0;
+  const awayXg = stats?.xgAway || 0;
+  const defensiveAlert = (phase?.risk || 0) >= 63 || awayShots > homeShots || awayXg > homeXg + .1;
+  const attackAlert = (phase?.attack || 0) < 66 || homeShots < awayShots;
+  const tired = weakestPlayer?.stamina < 60;
+  const priority = tired
+    ? { type: "sub", label: "교체 우선", text: `${weakestPlayer.item.name}(${weakestPlayer.slot})의 체력 ${weakestPlayer.stamina}. 같은 역할의 후보 투입을 우선 검토하세요.` }
+    : defensiveAlert
+      ? { type: "protect", label: "수비 보강", text: `${weakest?.label || "수비 라인"}과 ${vulnerableSide?.side || "측면"} 커버가 흔들립니다. 라인·압박을 안정화하거나 수비 역할을 보강하세요.` }
+      : attackAlert
+        ? { type: "push", label: "공격 보강", text: `${strongest?.label || "전방"}의 강점을 활용할 수 있습니다. 템포·폭을 조정하거나 공격 역할 후보를 준비하세요.` }
+        : { type: "maintain", label: "플랜 유지", text: `${strongest?.label || "현재 배치"}이 안정적입니다. 현 전술을 유지하며 다음 15분 데이터를 확인하세요.` };
+  const flow = homeXg > awayXg + .12 ? "우리 팀이 기대 득점 흐름에서 앞섭니다." : awayXg > homeXg + .12 ? "상대가 더 높은 기대 득점 흐름을 만들고 있습니다." : "양 팀의 기대 득점 흐름이 팽팽합니다.";
+  return {
+    minute,
+    phase: phase || { attack: 0, possession: 0, defense: 0, risk: 0 },
+    stats: stats || { shotsHome: 0, shotsAway: 0, onTargetHome: 0, onTargetAway: 0, xgHome: 0, xgAway: 0 },
+    units,
+    strongest,
+    weakest,
+    strongestPlayer,
+    weakestPlayer,
+    vulnerableSide,
+    priority,
+    flow,
+    summary: `${strongest?.label || "배치"} ${strongest?.score || 0}점이 강점이고 ${weakest?.label || "배치"} ${weakest?.score || 0}점이 보강 우선입니다.`
+  };
+}
+
+function tacticIndex(key, value) {
+  return (TACTIC_OPTIONS[key] || []).indexOf(value) - 1;
+}
+
+function calculateDecisionPreview(tactics, report) {
+  const phase = report?.phase || { attack: 0, possession: 0, defense: 0, risk: 0 };
+  const press = tacticIndex("pressing", tactics.pressing) - tacticIndex("pressing", state.tactics.pressing);
+  const line = tacticIndex("defensiveLine", tactics.defensiveLine) - tacticIndex("defensiveLine", state.tactics.defensiveLine);
+  const width = tacticIndex("attackWidth", tactics.attackWidth) - tacticIndex("attackWidth", state.tactics.attackWidth);
+  const tempo = tacticIndex("tempo", tactics.tempo) - tacticIndex("tempo", state.tactics.tempo);
+  const build = tacticIndex("buildUp", tactics.buildUp) - tacticIndex("buildUp", state.tactics.buildUp);
+  return {
+    attack: Math.round(clamp(phase.attack + press * 1.2 + tempo * 2.8 + width * 1.2 + build * 1.7, 35, 96)),
+    possession: Math.round(clamp(phase.possession - press * 1.2 - tempo * 1.8 + width * -.5 - build * 2.1, 35, 96)),
+    defense: Math.round(clamp(phase.defense + press * 2.1 - line * 1.2 - tempo * .6 - build * .4, 35, 96)),
+    risk: Math.round(clamp(phase.risk + press * 2.2 + line * 3.2 + tempo * 1.6 + build * 1.1, 18, 96))
+  };
+}
+
+function decisionOptionBlueprints(report) {
   const profile = opponentProfile();
   const counterSetup = profile.tempo === "fast"
     ? { pressing: "medium", defensiveLine: "low", attackWidth: "standard", tempo: "balanced", buildUp: "possession" }
     : { pressing: "medium", defensiveLine: "standard", attackWidth: "narrow", tempo: "balanced", buildUp: "possession" };
   return [
     {
+      id: "maintain",
+      label: "현 플랜 유지",
+      shortLabel: "KEEP",
+      goal: `${report?.strongest?.label || "현재 라인"} 강점을 유지`,
+      reason: report?.priority?.type === "maintain" ? report.priority.text : "교체 카드를 아끼고 현재 포메이션의 흐름을 더 확인합니다.",
+      tactics: { ...state.tactics }
+    },
+    {
       id: "protect",
       label: "흐름 잠금",
       shortLabel: "PROTECT",
       goal: "실점 위험을 낮추고 경기를 안정화",
-      reason: `${awayTeam().shortName}의 ${profile.threat}에 대비해 수비 블록과 점유를 우선합니다.`,
+      reason: report?.weakest?.id === "defense" ? `${report.weakest.label} 보강 신호를 반영해 ${awayTeam().shortName}의 ${profile.threat}을 먼저 차단합니다.` : `${awayTeam().shortName}의 ${profile.threat}에 대비해 수비 블록과 점유를 우선합니다.`,
       tactics: { pressing: "low", defensiveLine: "low", attackWidth: "narrow", tempo: "slow", buildUp: "possession" }
     },
     {
@@ -934,7 +1065,7 @@ function decisionOptionBlueprints() {
       label: "균형 회복",
       shortLabel: "CONTROL",
       goal: "상대 장점을 억제하며 주도권을 회복",
-      reason: "중원 연결과 전환 대비를 함께 유지하는 균형형 선택입니다.",
+      reason: report?.weakest?.id === "midfield" ? "중원 라인의 간격과 전환 부담을 먼저 낮추는 균형형 선택입니다." : "중원 연결과 전환 대비를 함께 유지하는 균형형 선택입니다.",
       tactics: counterSetup
     },
     {
@@ -942,33 +1073,27 @@ function decisionOptionBlueprints() {
       label: "승부수",
       shortLabel: "PUSH",
       goal: "득점 기회를 늘리는 적극적 전환",
-      reason: "압박과 템포를 끌어올려 후반의 공격 빈도를 높이는 선택입니다.",
+      reason: report?.strongest?.id === "attack" ? "강점인 전방 라인을 활용해 압박과 템포를 끌어올립니다." : "압박과 템포를 끌어올려 다음 구간의 공격 빈도를 높이는 선택입니다.",
       tactics: { pressing: "high", defensiveLine: "high", attackWidth: "wide", tempo: "fast", buildUp: "direct" }
     }
   ];
 }
 
-function calculateDecisionPreview(tactics) {
-  const previousTactics = state.tactics;
-  try {
-    state.tactics = { ...tactics };
-    return resultSnapshot(calculateSimulation());
-  } finally {
-    state.tactics = previousTactics;
-  }
-}
-
-function createDecisionReplay(result) {
+function createDecisionReplay(result, minute = 45) {
   const baseline = resultSnapshot(result);
   if (!baseline) return null;
+  const report = buildCheckpointAnalysis(result, minute);
   return {
     baseline,
+    phaseBaseline: report.phase,
+    minute,
+    report,
     chosenId: null,
-    options: decisionOptionBlueprints().map((option) => ({ ...option, preview: calculateDecisionPreview(option.tactics) }))
+    options: decisionOptionBlueprints(report).map((option) => ({ ...option, preview: calculateDecisionPreview(option.tactics, report) }))
   };
 }
 
-function buildDecisionImpact(baseline, result, choice) {
+function buildDecisionImpact(baseline, result, choice, appliedAt = 45) {
   if (!baseline || !result || !choice) return null;
   const after = resultSnapshot(result);
   const attackDelta = after.attack - baseline.attack;
@@ -985,7 +1110,7 @@ function buildDecisionImpact(baseline, result, choice) {
   return {
     label: choice.label,
     shortLabel: choice.shortLabel,
-    appliedAt: 45,
+    appliedAt,
     baseline,
     after,
     verdict,
@@ -1001,20 +1126,43 @@ function buildDecisionImpact(baseline, result, choice) {
 
 function applyDecisionChoice(choiceId) {
   const live = state.playback;
-  if (!live?.paused || live.breakKind !== "half") return;
+  if (!live?.paused || !live.decisionReplay) return;
   const choice = live.decisionReplay?.options.find((option) => option.id === choiceId);
   if (!choice) return;
   const beforeTactics = { ...state.tactics };
   state.tactics = { ...choice.tactics };
   state.coachAdvice = null;
-  recordLiveTacticChange(beforeTactics, state.tactics, `IF: ${choice.label}`);
+  const hasTacticChange = Object.keys(state.tactics).some((key) => beforeTactics[key] !== state.tactics[key]);
+  if (hasTacticChange) {
+    recordLiveTacticChange(beforeTactics, state.tactics, `${live.minute}′ 판단: ${choice.label}`);
+  } else {
+    recordLiveDecision(choice);
+  }
   const updatedLive = state.playback || live;
   state.playback = {
     ...updatedLive,
     decisionReplay: { ...live.decisionReplay, chosenId: choice.id },
+    checkpointReport: buildCheckpointAnalysis(state.result, live.minute),
     needsReplan: true
   };
   render();
+}
+
+function recordLiveDecision(choice) {
+  const live = state.playback;
+  if (!live?.paused || !choice) return;
+  const event = {
+    minute: live.minute, type: "decision", moment: "decision", team: "home", attackingTeam: "home",
+    scoreHome: live.homeScore, scoreAway: live.awayScore,
+    text: `${choice.label} 선택 · ${choice.goal}`
+  };
+  state.playback = {
+    ...live,
+    adjustmentEvents: [...(live.adjustmentEvents || []), event],
+    visibleEvents: [...live.visibleEvents, event],
+    needsReplan: true,
+    motion: buildEventMotion(event)
+  };
 }
 
 function recordLiveTacticChange(before, after, source = "수동") {
@@ -1385,12 +1533,75 @@ function calculateSimulation(options = {}) {
 
     const homeGoal = seeded(`${seedBase}-hg-${phaseIndex}`) < clamp(homePhaseXg * .48, .04, .46);
     const awayGoal = seeded(`${seedBase}-ag-${phaseIndex}`) < clamp(awayPhaseXg * .48, .04, .44);
-    const minute = clamp(start + 3 + Math.round(seeded(`${seedBase}-m-${phaseIndex}`) * 9), 1, 89);
+    // Reserve early and middle windows for the setup actions. The phase's
+    // outcome resolves near its end, making the event order readable as a
+    // football sequence rather than a random list of isolated highlights.
+    const minute = clamp(start + 10 + Math.round(seeded(`${seedBase}-m-${phaseIndex}`) * 3), start + 10, end - 1);
     const eventType = phaseIndex % 3 === 0 ? "press" : phaseIndex % 3 === 1 ? "build" : "wing";
     const homeActor = rankedActor(homePlayers, homeGoal ? "goal" : eventType, `${seedBase}-ha-${phaseIndex}`);
     const awayActor = rankedActor(opponentPlayers, awayGoal ? "goal" : eventType, `${seedBase}-aa-${phaseIndex}`);
     const homeRecovery = rankedActor(homePlayers, "recover", `${seedBase}-hr-${phaseIndex}`);
     const homeSupport = rankedActor(homePlayers, eventType === "wing" ? "wing" : "build", `${seedBase}-hp-${phaseIndex}`);
+    const homeHasMoment = homeThreat >= awayThreat;
+    const sequenceTeam = homeHasMoment ? "home" : "away";
+    const sequenceActor = homeHasMoment ? homeActor : awayActor;
+    const sequenceSupport = homeHasMoment ? homeSupport : homeRecovery;
+    // Every phase begins with a recognisable setup. Press and build phases
+    // receive a second progression event; wing phases already add the
+    // dedicated dribble sequence below. This yields 2-3 major scenes per
+    // 15-minute segment, each with its own animation and commentary entry.
+    events.push({
+      minute: start + 2,
+      type: eventType === "press" ? "control" : "attack",
+      moment: eventType === "press" ? "press" : eventType === "wing" ? "dribble" : "build",
+      team: sequenceTeam,
+      attackingTeam: sequenceTeam,
+      playerId: sequenceActor?.id,
+      supportId: sequenceSupport?.id,
+      scoreHome: homeScore,
+      scoreAway: awayScore,
+      text: eventType === "press"
+        ? `${homeHasMoment ? homeTeam().shortName : awayTeam().shortName}이(가) 압박으로 첫 볼 탈취를 노립니다.`
+        : eventType === "wing"
+          ? `${homeHasMoment ? homeTeam().shortName : awayTeam().shortName}이(가) 측면에서 1:1 돌파를 시작합니다.`
+          : `${homeHasMoment ? homeTeam().shortName : awayTeam().shortName}이(가) 점유를 유지하며 빌드업을 시작합니다.`
+    });
+    if (eventType !== "wing") {
+      events.push({
+        minute: start + 6,
+        type: eventType === "press" ? "attack" : "control",
+        moment: eventType === "press" ? "build" : "dribble",
+        team: sequenceTeam,
+        attackingTeam: sequenceTeam,
+        playerId: sequenceActor?.id,
+        supportId: sequenceSupport?.id,
+        scoreHome: homeScore,
+        scoreAway: awayScore,
+        text: eventType === "press"
+          ? `${sequenceActor?.name || (homeHasMoment ? homeTeam().shortName : awayTeam().shortName)}이(가) 탈취한 공을 다음 라인으로 운반합니다.`
+          : `${sequenceActor?.name || (homeHasMoment ? homeTeam().shortName : awayTeam().shortName)}이(가) 수비수를 앞에 두고 돌파를 시도합니다.`
+      });
+    }
+    // A wide phase has a short preceding 1v1 / overlap sequence even when its
+    // final outcome is a shot, save or goal.  This guarantees a readable
+    // dribble scene in every full simulation rather than relying on chance.
+    if (eventType === "wing") {
+      const dribbleActor = homeHasMoment ? homeActor : homeRecovery;
+      const dribbleSupport = homeHasMoment ? homeSupport : homeRecovery;
+      events.push({
+        minute: clamp(minute - 3, start + 1, 89), type: homeHasMoment ? "attack" : "warning", moment: "cross",
+        team: homeHasMoment ? "home" : "away", attackingTeam: homeHasMoment ? "home" : "away",
+        playerId: dribbleActor?.id, supportId: dribbleSupport?.id, scoreHome: homeScore, scoreAway: awayScore,
+        text: homeHasMoment
+          ? `${dribbleActor?.name || "측면 공격수"}의 드리블과 오버랩이 상대 측면 수비를 끌어냅니다.`
+          : `${awayActor?.name || awayTeam().name}의 측면 드리블에 우리 수비가 커버를 시도합니다.`
+      });
+    }
+    if (eventType === "wing" && events.at(-1)?.moment === "cross") {
+      events.at(-1).text = homeHasMoment
+        ? `${homeActor?.name || homeTeam().shortName}이(가) 측면 돌파 뒤 박스로 크로스를 올립니다.`
+        : `${awayActor?.name || awayTeam().shortName}이(가) 측면에서 크로스를 시도합니다.`;
+    }
     if (homeGoal) {
       homeScore += 1;
       events.push({ minute, type: "goal", moment: "goal", team: "home", attackingTeam: "home", playerId: homeActor?.id, supportId: homeSupport?.id, scoreHome: homeScore, scoreAway: awayScore, text: `${homeActor?.name || "공격수"}이(가) ${homeActor?.roleTags.includes("finisher") ? "피니셔 역할의 마무리" : "침투 타이밍"}로 득점 기회를 마무리합니다.` });
@@ -1398,14 +1609,15 @@ function calculateSimulation(options = {}) {
       awayScore += 1;
       events.push({ minute, type: "goal", moment: "goal", team: "away", attackingTeam: "away", playerId: homeGoalkeeper?.id, supportId: homeRecovery?.id, scoreHome: homeScore, scoreAway: awayScore, text: `${awayActor?.name || awayTeam().name}의 ${phaseProfile.label}이(가) 우리 수비 블록을 흔들며 득점합니다.` });
     } else {
-      const homeHasMoment = homeThreat >= awayThreat;
       const actor = homeHasMoment ? homeActor : awayActor;
       const onTarget = homeHasMoment ? homeOnTarget > 0 : awayOnTarget > 0;
+      // The accompanying dribble / overlap sequence has already played for
+      // wing phases; this event now resolves that phase with a shot or save.
       const moment = onTarget ? "save" : eventType === "press" ? "press" : eventType === "wing" ? "shot" : "build";
       const type = moment === "save" ? "save" : homeHasMoment ? (eventType === "press" ? "control" : "attack") : "warning";
       const text = homeHasMoment
-        ? moment === "save" ? `${actor?.name || "공격수"}의 유효 슈팅, 상대 골키퍼가 선방으로 막아냅니다.` : `${actor?.name || "우리 팀"}의 ${eventType === "press" ? "압박과 회수" : eventType === "build" ? "전개 패스" : "측면 돌파"}가 위협적인 장면을 만듭니다.`
-        : moment === "save" ? `${homeGoalkeeper?.name || "골키퍼"}이(가) ${awayActor?.name || awayTeam().name}의 유효 슈팅을 선방합니다.` : `${awayActor?.name || awayTeam().name}의 수비 전환이 우리 진영을 시험합니다.`;
+        ? moment === "save" ? `${actor?.name || "공격수"}의 유효 슈팅, 상대 골키퍼가 선방으로 막아냅니다.` : moment === "dribble" ? `${actor?.name || "우리 팀"}의 드리블 돌파와 오버랩이 측면에서 수비 간격을 흔듭니다.` : `${actor?.name || "우리 팀"}의 ${eventType === "press" ? "압박과 회수" : "전개 패스"}가 위협적인 장면을 만듭니다.`
+        : moment === "save" ? `${homeGoalkeeper?.name || "골키퍼"}이(가) ${awayActor?.name || awayTeam().name}의 유효 슈팅을 선방합니다.` : moment === "dribble" ? `${awayActor?.name || awayTeam().name}의 측면 드리블에 우리 수비 라인이 커버를 시도합니다.` : `${awayActor?.name || awayTeam().name}의 수비 전환이 우리 진영을 시험합니다.`;
       events.push({ minute, type, moment, team: homeHasMoment ? "home" : "away", attackingTeam: homeHasMoment ? "home" : "away", playerId: homeHasMoment ? actor?.id : (moment === "save" ? homeGoalkeeper?.id : homeRecovery?.id), supportId: homeHasMoment ? homeSupport?.id : homeRecovery?.id, scoreHome: homeScore, scoreAway: awayScore, text });
     }
     if (phaseIndex === 3 || phaseIndex === 4) {
@@ -1413,18 +1625,32 @@ function calculateSimulation(options = {}) {
       if (tired?.stamina < 56) events.push({ minute: clamp(minute + 3, 1, 89), type: "sub", moment: "fitness", team: "home", attackingTeam: "home", playerId: tired.item.id, scoreHome: homeScore, scoreAway: awayScore, text: `${tired.item.name}의 체력이 ${tired.stamina}까지 내려갔습니다. 역할 부담을 줄이거나 교체 카드를 준비하세요.` });
     }
     staminaTimeline.push({ minute: end, players: homePlayers.map((item) => ({ id: item.id, name: item.name, stamina: homeStamina[item.id], slot: homeSlotsById[item.id] })) });
-    phaseMetrics.push({ minute: end, attack: Math.round(homeAttack), possession: Math.round(homePossession), defense: Math.round(homeDefense), risk: Math.round(clamp(risk + awayAttack - homeDefense * .32, 20, 92)) });
+    // Attack/defense are attribute-scale scores (roughly 50–90), while risk is
+    // a 0–100 match-state index.  Normalising the difference keeps the 15′
+    // briefing meaningful instead of pinning every phase at its maximum.
+    const phaseRisk = Math.round(clamp(risk + (awayAttack - homeDefense) * .45 + (awayPossession - homePossession) * .28, 20, 92));
+    phaseMetrics.push({ minute: end, attack: Math.round(homeAttack), possession: Math.round(homePossession), defense: Math.round(homeDefense), risk: phaseRisk });
   });
 
-  events.push({ minute: 45, type: "half", moment: "half", team: "neutral", attackingTeam: "neutral", scoreHome: 0, scoreAway: 0, text: "하프타임 · 전술과 교체 카드를 점검하세요." });
+  // A checkpoint is a real playback event, not a passive label.  It is inserted
+  // after each completed 15-minute phase so the next phase can be recalculated
+  // from the manager's substitution / tactic decision.
   events.sort((a, b) => a.minute - b.minute);
-  const halfTimeEvent = events.find((event) => event.moment === "half");
-  const preHalfEvent = [...events].filter((event) => event.minute < 45).at(-1);
-  if (halfTimeEvent) {
-    halfTimeEvent.scoreHome = preHalfEvent?.scoreHome || 0;
-    halfTimeEvent.scoreAway = preHalfEvent?.scoreAway || 0;
-    halfTimeEvent.text = `하프타임 · ${homeTeam().shortName} ${halfTimeEvent.scoreHome} - ${halfTimeEvent.scoreAway} ${awayTeam().shortName}. 전술과 교체 카드를 점검하세요.`;
-  }
+  COACH_CHECKPOINT_MINUTES.forEach((minute) => {
+    const prior = [...events].filter((event) => event.minute < minute).at(-1);
+    const isHalf = minute === 45;
+    events.push({
+      minute,
+      type: "checkpoint",
+      moment: "checkpoint",
+      team: "neutral",
+      attackingTeam: "neutral",
+      scoreHome: prior?.scoreHome || 0,
+      scoreAway: prior?.scoreAway || 0,
+      text: `${isHalf ? "하프타임" : `${minute}분`} 코치 체크포인트 · ${homeTeam().shortName} ${prior?.scoreHome || 0} - ${prior?.scoreAway || 0} ${awayTeam().shortName}. 라인별 흐름을 점검하고 다음 15분 계획을 선택하세요.`
+    });
+  });
+  events.sort((a, b) => a.minute - b.minute || (a.moment === "checkpoint" ? -1 : b.moment === "checkpoint" ? 1 : 0));
   const finalMetric = phaseMetrics[phaseMetrics.length - 1];
   const attack = Math.round(clamp(average(phaseMetrics.map((item) => item.attack)), 35, 95));
   const possession = Math.round(clamp(average(phaseMetrics.map((item) => item.possession)), 35, 95));
@@ -1695,54 +1921,285 @@ function buildEventMotion(event) {
   const actorStart = event.playerId ? slotCoordinates(event.playerId) : homeAttack ? [50, 38] : [50, 34];
   const lane = seeded(`${event.minute}-${event.text}`) > .5 ? 1 : -1;
   const players = {};
-  const addMove = (id, role, x, y) => { if (id && state.lineup && slotForPlayer(id)) players[id] = { role, x, y }; };
+  const rivals = [];
+  const lineupEntries = Object.entries(state.lineup)
+    .map(([slot, id]) => ({ id, slot, position: basePosition(slot) }))
+    .filter((entry) => entry.id && player(entry.id));
+  const opponentStarters = awayTeam().defaultStartingXI.map(player).filter(Boolean);
+  const clampPoint = (x, y) => [clamp(Math.round(x), 6, 94), clamp(Math.round(y), 7, 93)];
+  const opponentFor = (positions = [], excludeId = null) => opponentStarters.find((item) => positions.includes(item.primaryPosition) && item.id !== excludeId)
+    || opponentStarters.find((item) => item.primaryPosition !== "GK" && item.id !== excludeId)
+    || opponentStarters.find((item) => item.id !== excludeId);
+  const addRival = (playerData, role, from, mid, to, delay = 0) => {
+    if (!playerData) return;
+    rivals.push({
+      id: `${playerData.id}-${role}-${rivals.length}`,
+      name: playerData.name,
+      position: playerData.primaryPosition,
+      role,
+      from: clampPoint(...from),
+      mid: clampPoint(...mid),
+      to: clampPoint(...to),
+      delay
+    });
+  };
+  // Defensive cards are intentionally selective: one defender closes the
+  // ball carrier, another shades the passing or shooting lane.  This keeps
+  // the rest of the back line in its shape instead of marching in a row.
+  const addRivalMarker = (target, { role = "marker", positions = ["CB", "RB", "LB", "DM"], excludeId = null, delay = 0, depth = 4 } = {}) => {
+    const marker = opponentFor(positions, excludeId);
+    if (!marker) return null;
+    const side = target[0] < 47 ? -1 : target[0] > 53 ? 1 : lane;
+    const from = [target[0] - side * 21, clamp(target[1] - 13, 9, 82)];
+    const mid = [target[0] - side * 8, clamp(target[1] - 2, 9, 88)];
+    const to = [target[0] - side * 3, clamp(target[1] + depth, 9, 90)];
+    addRival(marker, role, from, mid, to, delay);
+    return marker;
+  };
+  const addRivalKeeperCover = (target, delay = 0) => {
+    const keeper = opponentFor(["GK"]);
+    if (!keeper) return null;
+    const guardX = clamp(50 + (target[0] - 50) * .18, 42, 58);
+    addRival(keeper, "keeper", [50, 8], [guardX, 9], [guardX, 11], delay);
+    return keeper;
+  };
+  const addRivalPassingChain = (from, mid, to, delay = 0) => {
+    const passer = opponentFor(["CB", "DM", "CM"]);
+    const receiver = opponentFor(["CM", "AM", "RW", "LW"], passer?.id);
+    const runner = opponentFor(["ST", "RW", "LW", "AM"], receiver?.id);
+    addRival(passer, "carrier", from, [from[0] + (mid[0] - from[0]) * .55, from[1] + (mid[1] - from[1]) * .55], mid, delay);
+    addRival(receiver, "receiver", [mid[0] - 7, mid[1] - 6], mid, [mid[0] + (to[0] - mid[0]) * .4, mid[1] + (to[1] - mid[1]) * .4], delay + 230);
+    addRival(runner, "striker", [to[0] - 6, to[1] - 8], [to[0] - 2, to[1] - 3], to, delay + 480);
+    return { passer, receiver, runner };
+  };
+  const lineupPlayerFor = (preferredId, positions = [], excludeId = null) => {
+    const preferred = lineupEntries.find((entry) => entry.id === preferredId && entry.id !== excludeId);
+    // The commentary and the animation must name the same player. A visible
+    // event actor therefore wins even when the manager has freely placed that
+    // player in an unconventional slot; positional fallback is only for a
+    // player who is not currently on the pitch.
+    if (preferred) return preferred.id;
+    const positional = lineupEntries.find((entry) => positions.includes(entry.position) && entry.id !== excludeId);
+    if (positional) return positional.id;
+    return lineupEntries.find((entry) => entry.position !== "GK" && entry.id !== excludeId)?.id
+      || lineupEntries.find((entry) => entry.id !== excludeId)?.id;
+  };
+  const addMove = (id, role, x, y, delay = 0, force = false) => {
+    if (!id || !state.lineup || !slotForPlayer(id) || (!force && players[id])) return;
+    players[id] = { role, x, y, delay };
+  };
+  const moveAttackingShape = (intensity = 1) => {
+    lineupEntries.forEach((entry, index) => {
+      const stagger = (index % 3) * 90;
+      if (["ST", "RW", "LW", "AM"].includes(entry.position)) {
+        addMove(entry.id, entry.position === "ST" ? "runner" : "overlap", lane * (5 + (index % 2) * 4), -Math.round((entry.position === "ST" ? 19 : 14) * intensity), stagger);
+      } else if (["DM", "CM"].includes(entry.position)) {
+        addMove(entry.id, "support", lane * (2 + (index % 2) * 3), -Math.round(9 * intensity), stagger);
+      } else if (entry.position !== "GK") {
+        addMove(entry.id, "hold", lane * (index % 2 ? 2 : -2), -Math.round(4 * intensity), stagger);
+      }
+    });
+  };
+  const moveDefensiveShape = (intensity = 1) => {
+    lineupEntries.forEach((entry, index) => {
+      const stagger = (index % 3) * 90;
+      if (["GK", "CB", "RB", "LB"].includes(entry.position)) {
+        addMove(entry.id, entry.position === "GK" ? "keeper" : "cover", lane * (entry.position === "GK" ? 8 : (index % 2 ? 5 : -5)), Math.round((entry.position === "GK" ? 3 : 13) * intensity), stagger);
+      } else if (["DM", "CM", "AM"].includes(entry.position)) {
+        addMove(entry.id, "recover", lane * (index % 2 ? 5 : -5), Math.round(11 * intensity), stagger);
+      } else {
+        addMove(entry.id, "screen", lane * (index % 2 ? 3 : -3), Math.round(6 * intensity), stagger);
+      }
+    });
+  };
   let ballStart = actorStart;
+  let ballMid = [50 + lane * 5, homeAttack ? 30 : 70];
   let ballEnd = homeAttack ? [50 + lane * 7, 8] : [50 + lane * 7, 92];
   let overlay = { kind: moment, team: event.attackingTeam, title: "", detail: "" };
+  let duel = null;
 
   if (moment === "goal") {
     if (homeAttack) {
-      addMove(event.playerId, "attacker", lane * 18, -54);
-      addMove(event.supportId, "support", -lane * 18, -31);
+      addMove(event.playerId, "attacker", lane * 18, -54, 0, true);
+      addMove(event.supportId, "support", -lane * 18, -31, 130, true);
+      moveAttackingShape(1.3);
+      ballMid = [50 + lane * 14, 22];
+      const goalMarker = addRivalMarker(ballMid, { role: "marker", delay: 130 });
+      addRivalMarker([50 + lane * 7, 15], { role: "lane-block", positions: ["CB", "DM"], excludeId: goalMarker?.id, delay: 360, depth: 2 });
+      addRivalKeeperCover(ballMid, 520);
       overlay = { kind: "goal", team: "home", title: "GOAL!", detail: `${homeTeam().shortName} 득점` };
     } else {
-      addMove(event.playerId, "keeper", lane * 36, -18);
-      addMove(event.supportId, "defender", -lane * 18, -30);
+      addMove(event.playerId, "keeper", lane * 36, -18, 0, true);
+      addMove(event.supportId, "defender", -lane * 18, -30, 120, true);
+      moveDefensiveShape(1.25);
       ballStart = [50 + lane * 10, 36];
+      ballMid = [50 + lane * 8, 66];
+      const rivalStriker = opponentFor(["ST", "AM", "RW", "LW"]);
+      addRival(rivalStriker, "striker", [50 + lane * 10, 36], [50 + lane * 8, 59], [50 + lane * 7, 78], 80);
       overlay = { kind: "goal", team: "away", title: "GOAL", detail: `${awayTeam().shortName} 득점` };
     }
   } else if (moment === "save") {
     if (homeAttack) {
-      addMove(event.playerId, "attacker", lane * 14, -45);
-      addMove(event.supportId, "support", -lane * 13, -25);
+      addMove(event.playerId, "attacker", lane * 14, -45, 0, true);
+      addMove(event.supportId, "support", -lane * 13, -25, 120, true);
+      moveAttackingShape(1.1);
+      ballMid = [50 + lane * 10, 22];
+      const saveMarker = addRivalMarker(ballMid, { role: "marker", delay: 120 });
+      addRivalMarker([50 + lane * 6, 17], { role: "lane-block", positions: ["CB", "DM"], excludeId: saveMarker?.id, delay: 340, depth: 2 });
+      addRivalKeeperCover(ballMid, 510);
       overlay = { kind: "save", team: "home", title: "ON TARGET", detail: "상대 골키퍼 선방" };
     } else {
-      addMove(event.playerId, "keeper", lane * 32, -15);
-      addMove(event.supportId, "defender", -lane * 14, -23);
+      addMove(event.playerId, "keeper", lane * 32, -15, 0, true);
+      addMove(event.supportId, "defender", -lane * 14, -23, 120, true);
+      moveDefensiveShape(1.15);
       ballStart = [50 + lane * 10, 37];
+      ballMid = [50 + lane * 8, 67];
+      const rivalStriker = opponentFor(["ST", "AM", "RW", "LW"]);
+      addRival(rivalStriker, "striker", [50 + lane * 10, 37], [50 + lane * 8, 58], [50 + lane * 7, 72], 80);
       overlay = { kind: "save", team: "away", title: "SAVED!", detail: `${player(event.playerId)?.name || "골키퍼"} 선방` };
     }
   } else if (moment === "shot") {
     if (homeAttack) {
-      addMove(event.playerId, "attacker", lane * 12, -40);
-      addMove(event.supportId, "support", -lane * 15, -22);
+      addMove(event.playerId, "attacker", lane * 12, -40, 0, true);
+      addMove(event.supportId, "support", -lane * 15, -22, 110, true);
+      moveAttackingShape(1.1);
+      ballMid = [50 + lane * 8, 23];
+      const shotMarker = addRivalMarker(ballMid, { role: "marker", delay: 120 });
+      addRivalMarker([50 + lane * 5, 19], { role: "lane-block", positions: ["CB", "DM"], excludeId: shotMarker?.id, delay: 330, depth: 2 });
+      addRivalKeeperCover(ballMid, 500);
     } else {
-      addMove(event.playerId, "defender", lane * 16, -22);
+      addMove(event.playerId, "defender", lane * 16, -22, 0, true);
+      moveDefensiveShape(1.05);
       ballStart = [50 + lane * 12, 37];
+      ballMid = [50 + lane * 9, 68];
+      const rivalStriker = opponentFor(["ST", "AM", "RW", "LW"]);
+      addRival(rivalStriker, "striker", [50 + lane * 12, 37], [50 + lane * 9, 58], [50 + lane * 7, 72], 80);
     }
     overlay = { kind: "shot", team: event.attackingTeam, title: "SHOT", detail: "슈팅 기회" };
+  } else if (moment === "dribble") {
+    if (homeAttack) {
+      // Event actors may originate from the full national roster, while the
+      // board only renders the chosen XI.  Resolve both roles back to visible
+      // pitch cards so the ball never appears to dribble without a carrier.
+      const dribblerId = lineupPlayerFor(event.playerId, ["LW", "RW", "AM", "ST"]);
+      const overlapId = lineupPlayerFor(event.supportId, ["LB", "RB", "LW", "RW", "AM"], dribblerId);
+      const dribblerStart = slotCoordinates(dribblerId);
+      const wideLane = dribblerStart[0] <= 50 ? -1 : 1;
+      addMove(dribblerId, "duel-winner", wideLane * 42, -44, 0, true);
+      addMove(overlapId, "overlap", wideLane * 48, -34, 170, true);
+      moveAttackingShape(1.05);
+      ballStart = dribblerStart;
+      ballEnd = [clamp(dribblerStart[0] + wideLane * 16, 6, 94), Math.max(14, dribblerStart[1] - 36)];
+      ballMid = [clamp(dribblerStart[0] + wideLane * 8, 6, 94), Math.max(20, dribblerStart[1] - 16)];
+      const duelDefender = opponentFor(["RB", "LB", "CB", "DM"]);
+      addRival(duelDefender, "duel-loser", [ballMid[0] - wideLane * 15, ballMid[1] - 5], ballMid, [ballMid[0] - wideLane * 25, ballMid[1] + 8], 120);
+      addRivalMarker(ballEnd, { role: "lane-block", positions: ["CB", "DM"], excludeId: duelDefender?.id, delay: 420, depth: 3 });
+      duel = { winner: "home", point: ballMid, label: "1v1 WIN" };
+      overlay = { kind: "dribble", team: "home", title: "DRIBBLE", detail: "측면 1대1 경합 승리 · 오버랩" };
+    } else {
+      moveDefensiveShape(1.15);
+      const rivalDribbler = opponentFor(["RW", "LW", "AM", "ST"]);
+      const rivalSupport = opponentFor(["RB", "LB", "RW", "LW", "AM"], rivalDribbler?.id);
+      const sideX = lane > 0 ? 88 : 12;
+      const rivalStart = [sideX, 42];
+      const rivalMid = [sideX - lane * 5, 59];
+      const rivalEnd = [50 + lane * 7, 77];
+      const homeChaser = lineupPlayerFor(event.playerId, ["RB", "LB", "CB", "DM"]);
+      addMove(homeChaser, "duel-loser", -lane * 20, 25, 180, true);
+      addRival(rivalDribbler, "duel-winner", rivalStart, rivalMid, rivalEnd, 60);
+      addRival(rivalSupport, "overlap", [50 + lane * 4, 46], [50 + lane * 7, 61], [50 + lane * 5, 72], 520);
+      ballStart = rivalStart;
+      ballEnd = rivalEnd;
+      ballMid = rivalMid;
+      duel = { winner: "away", point: rivalMid, label: "1v1 LOST" };
+      overlay = { kind: "dribble", team: "away", title: "WIDE BREAK", detail: "상대 측면 1대1 경합 승리" };
+    }
+  } else if (moment === "cross") {
+    if (homeAttack) {
+      const crosserId = lineupPlayerFor(event.playerId, ["LW", "RW", "LB", "RB", "AM"]);
+      const targetId = lineupPlayerFor(event.supportId, ["ST", "AM", "RW", "LW"], crosserId);
+      const crosserStart = slotCoordinates(crosserId);
+      const targetStart = slotCoordinates(targetId);
+      const sideLane = crosserStart[0] <= 50 ? -1 : 1;
+      addMove(crosserId, "overlap", sideLane * 36, -22, 0, true);
+      addMove(targetId, "runner", -lane * 8, -20, 250, true);
+      moveAttackingShape(.95);
+      ballStart = crosserStart;
+      ballMid = [clamp(crosserStart[0] + sideLane * 6, 7, 93), Math.max(12, crosserStart[1] - 17)];
+      ballEnd = [targetStart[0], Math.max(12, targetStart[1] - 15)];
+      const targetMarker = addRivalMarker(ballEnd, { role: "marker", delay: 120, depth: 3 });
+      addRivalMarker(ballMid, { role: "lane-block", positions: ["RB", "LB", "DM"], excludeId: targetMarker?.id, delay: 310, depth: 2 });
+      addRivalKeeperCover(ballEnd, 500);
+      overlay = { kind: "cross", team: "home", title: "CROSS", detail: "측면 크로스 · 박스 침투" };
+    } else {
+      moveDefensiveShape(1.08);
+      const rivalWinger = opponentFor(["RW", "LW", "AM"]);
+      const rivalTarget = opponentFor(["ST", "AM", "RW", "LW"], rivalWinger?.id);
+      const rivalNearPost = opponentFor(["AM", "RW", "LW", "CM"], rivalTarget?.id);
+      const sideX = lane > 0 ? 88 : 12;
+      const crossStart = [sideX, 43];
+      const crossMid = [sideX + (lane > 0 ? -7 : 7), 60];
+      const crossEnd = [50 + lane * 3, 76];
+      const homeChaser = lineupPlayerFor(event.playerId, ["RB", "LB", "CB", "DM"]);
+      addMove(homeChaser, "chase", (sideX - slotCoordinates(homeChaser)[0]) * .35, 18, 180, true);
+      addRival(rivalWinger, "carrier", crossStart, crossMid, [crossMid[0], crossMid[1] + 3], 60);
+      addRival(rivalNearPost, "receiver", [50 - lane * 12, 60], [50 - lane * 6, 69], [50 - lane * 3, 75], 300);
+      addRival(rivalTarget, "striker", [crossEnd[0], 63], [crossEnd[0], 70], crossEnd, 520);
+      ballStart = crossStart;
+      ballMid = crossMid;
+      ballEnd = crossEnd;
+      overlay = { kind: "cross", team: "away", title: "CROSS", detail: "상대 측면 크로스 · 박스 수비" };
+    }
   } else if (moment === "press") {
-    addMove(event.playerId, "press", lane * 17, -19);
-    addMove(event.supportId, "support", -lane * 13, -14);
+    homeAttack ? moveAttackingShape(.95) : moveDefensiveShape(.95);
     ballEnd = homeAttack ? [54 + lane * 5, 42] : [46 + lane * 5, 57];
-    overlay = { kind: "press", team: event.attackingTeam, title: "PRESS WIN", detail: "전방 압박 성공" };
+    ballMid = homeAttack ? [50 + lane * 7, 45] : [50 + lane * 6, 55];
+    const rivalCarrier = opponentFor(["CM", "DM", "AM", "CB"]);
+    const rivalStart = homeAttack ? [50 + lane * 16, 45] : [50 + lane * 9, 55];
+    const rivalEnd = homeAttack ? [50 + lane * 8, 43] : [50 + lane * 12, 58];
+    if (homeAttack) {
+      addMove(event.playerId, "duel-winner", lane * 17, -19, 0, true);
+      addMove(event.supportId, "support", -lane * 13, -14, 120, true);
+      addRival(rivalCarrier, "duel-loser", rivalStart, ballMid, rivalEnd, 140);
+      duel = { winner: "home", point: ballMid, label: "PRESS WIN" };
+    } else {
+      const homeChallenger = lineupPlayerFor(event.supportId, ["DM", "CM", "CB", "RB", "LB"]);
+      addMove(homeChallenger, "duel-loser", -lane * 16, 16, 0, true);
+      addRival(rivalCarrier, "duel-winner", rivalStart, ballMid, rivalEnd, 140);
+      duel = { winner: "away", point: ballMid, label: "PRESS LOST" };
+    }
+    ballStart = rivalStart;
+    overlay = { kind: "press", team: event.attackingTeam, title: homeAttack ? "PRESS WIN" : "PRESS LOST", detail: homeAttack ? "중앙 볼 경합 승리" : "중앙 볼 경합에서 밀림" };
   } else if (moment === "build") {
-    addMove(event.playerId, "builder", lane * 15, -24);
-    addMove(event.supportId, "support", -lane * 19, -27);
-    ballEnd = homeAttack ? [50 + lane * 15, Math.max(14, actorStart[1] - 26)] : [50 + lane * 12, 67];
+    if (homeAttack) {
+      const builderId = lineupPlayerFor(event.playerId, ["CM", "DM", "AM", "CB"]);
+      const receiverId = lineupPlayerFor(event.supportId, ["CM", "AM", "RW", "LW"], builderId);
+      const runnerId = lineupPlayerFor(null, ["ST", "RW", "LW", "AM"], receiverId);
+      const builderStart = slotCoordinates(builderId);
+      const receiverStart = slotCoordinates(receiverId);
+      const runnerStart = slotCoordinates(runnerId);
+      addMove(builderId, "builder", lane * 12, -16, 0, true);
+      addMove(receiverId, "support", lane * 10, -18, 150, true);
+      addMove(runnerId, "runner", lane * 14, -26, 330, true);
+      moveAttackingShape(.9);
+      ballStart = builderStart;
+      ballMid = receiverStart;
+      ballEnd = runnerStart;
+      const receiverMarker = addRivalMarker(receiverStart, { role: "marker", delay: 170, depth: 3 });
+      addRivalMarker([runnerStart[0] - lane * 4, runnerStart[1] - 5], { role: "lane-block", positions: ["CB", "DM"], excludeId: receiverMarker?.id, delay: 390, depth: 2 });
+    } else {
+      const rivalStart = [50 + lane * 14, 38];
+      const rivalMid = [50 + lane * 12, 54];
+      const rivalEnd = [50 + lane * 12, 67];
+      moveDefensiveShape(.9);
+      addRivalPassingChain(rivalStart, rivalMid, rivalEnd, 80);
+      ballStart = rivalStart;
+      ballMid = rivalMid;
+      ballEnd = rivalEnd;
+    }
     overlay = { kind: "build", team: event.attackingTeam, title: "BUILD UP", detail: "전개 패스 연결" };
   } else if (moment === "fitness") {
-    addMove(event.playerId, "tired", 0, 8);
+    addMove(event.playerId, "tired", 0, 8, 0, true);
     ballStart = [50, 50]; ballEnd = [50, 50];
     overlay = { kind: "fitness", team: "home", title: "FATIGUE", detail: "교체 타이밍 점검" };
   } else if (moment === "sub") {
@@ -1762,7 +2219,7 @@ function buildEventMotion(event) {
     ballStart = [50, 50]; ballEnd = [50, 50];
     overlay = { kind: "finish", team: "neutral", title: "FULL TIME", detail: "경기 종료" };
   }
-  return { moment, players, ballStart, ballEnd, overlay };
+  return { moment, players, rivals, ballStart, ballMid, ballEnd, overlay, duel };
 }
 
 function slotCard(slot) {
@@ -1773,7 +2230,7 @@ function slotCard(slot) {
   const matchState = assigned ? playerState(assigned, state.scenarioId) : null;
   const statRating = assigned ? positionStatRating(assigned, slot) : 0;
   const movement = assigned ? state.playback?.motion?.players?.[assigned.id] : null;
-  return `<button class="pitch-slot ${assigned ? "filled" : "empty"} ${fitClass} ${state.playback?.activePlayerId === assigned?.id ? "involved" : ""} ${movement ? `motion-${movement.role}` : ""}" data-slot="${slot}" style="--x:${coords[0]}%;--y:${coords[1]}%;--move-x:${movement?.x || 0}px;--move-y:${movement?.y || 0}px">
+  return `<button class="pitch-slot ${assigned ? "filled" : "empty"} ${fitClass} ${state.playback?.activePlayerId === assigned?.id ? "involved" : ""} ${movement ? `motion-${movement.role}` : ""}" data-slot="${slot}" style="--x:${coords[0]}%;--y:${coords[1]}%;--move-x:${movement?.x || 0}px;--move-y:${movement?.y || 0}px;--move-x-a:${(movement?.x || 0) * .34}px;--move-y-a:${(movement?.y || 0) * .34}px;--move-x-b:${(movement?.x || 0) * .72}px;--move-y-b:${(movement?.y || 0) * .7}px;--move-x-cover-a:${(movement?.x || 0) * .55}px;--move-y-cover-a:${(movement?.y || 0) * .33}px;--move-x-cover-b:${(movement?.x || 0) * .3}px;--move-y-cover-b:${(movement?.y || 0) * .58}px;--motion-delay:${movement?.delay || 0}ms">
     <span class="slot-position">${slot}</span>
     ${assigned ? `<span class="slot-player" draggable="true" data-player="${assigned.id}"><b>${assigned.name}</b><small><span class="slot-rating">평점 ${statRating}</span><span>체력 ${matchState.stamina}</span></small></span><span class="fit-ring">${fit}</span>` : `<span class="slot-empty">선수 배치</span>`}
   </button>`;
@@ -1783,17 +2240,34 @@ function renderPositionZones() {
   return `<div class="position-zones ${state.selectedPlayerId ? "selecting" : ""}">${positionZones.map((zone) => `<span class="position-zone" data-position-zone="${zone.id}" style="--zone-x:${zone.coords[0]}%;--zone-y:${zone.coords[1]}%">${zone.label}</span>`).join("")}</div>`;
 }
 
+function renderRivalCard(rival) {
+  const displayName = rival.name.split(" ").at(-1) || rival.name;
+  return `<div class="rival-card rival-${rival.role}" aria-hidden="true" style="--rival-from-x:${rival.from[0]}%;--rival-from-y:${rival.from[1]}%;--rival-mid-x:${rival.mid[0]}%;--rival-mid-y:${rival.mid[1]}%;--rival-to-x:${rival.to[0]}%;--rival-to-y:${rival.to[1]}%;--rival-delay:${rival.delay}ms">
+    <span>${rival.position}</span><b>${displayName}</b><i>${awayTeam().shortName}</i>
+  </div>`;
+}
+
 function renderPitch() {
   const live = state.playback;
   const motion = live?.motion;
   const ballStart = motion?.ballStart || [50, 50];
+  const ballMid = motion?.ballMid || [50, 50];
   const ballEnd = motion?.ballEnd || [50, 50];
-  return `<section class="pitch-shell">
+  const goalEffect = motion?.moment === "goal"
+    ? `<div class="goal-effect ${motion.overlay?.team || "home"}" aria-hidden="true"><span>⚽</span><i>NET RIPPLE</i></div>`
+    : "";
+  const duelEffect = motion?.duel
+    ? `<div class="duel-impact ${motion.duel.winner}" aria-hidden="true" style="--duel-x:${motion.duel.point[0]}%;--duel-y:${motion.duel.point[1]}%"><i>✦</i><span>${motion.duel.label}</span></div>`
+    : "";
+  return `<section class="pitch-shell" tabindex="-1" aria-label="전술 경기장">
     <div class="pitch-toolbar"><span><i class="drag-icon">↗</i> FIFA POSITION DROP MAP</span><span class="auto-formation">AUTO ${formation().label}</span><span class="fit-legend"><i class="good"></i>적합 <i class="warn"></i>보통 <i class="bad"></i>주의</span></div>
-    <div class="pitch free-layout ${live?.isPlaying ? "playback-active" : ""} ${motion ? `moment-${motion.moment}` : ""}"><span class="match-orb" style="--ball-start-x:${ballStart[0]}%;--ball-start-y:${ballStart[1]}%;--ball-end-x:${ballEnd[0]}%;--ball-end-y:${ballEnd[1]}%">⚽</span>${motion?.overlay ? `<div class="pitch-event-overlay ${motion.overlay.kind} ${motion.overlay.team}"><b>${motion.overlay.title}</b><span>${motion.overlay.detail}</span></div>` : ""}
+    <div class="pitch free-layout ${live?.isPlaying ? "playback-active" : ""} ${motion ? `moment-${motion.moment}` : ""} ${motion?.duel ? "duel-active" : ""}"><span class="match-orb" style="--ball-start-x:${ballStart[0]}%;--ball-start-y:${ballStart[1]}%;--ball-mid-x:${ballMid[0]}%;--ball-mid-y:${ballMid[1]}%;--ball-end-x:${ballEnd[0]}%;--ball-end-y:${ballEnd[1]}%">⚽</span>${motion?.overlay ? `<div class="pitch-event-overlay ${motion.overlay.kind} ${motion.overlay.team}"><b>${motion.overlay.title}</b><span>${motion.overlay.detail}</span></div>` : ""}
       <div class="pitch-lines"><span class="halfway"></span><span class="center-circle"></span><span class="penalty top"></span><span class="penalty bottom"></span></div>
       ${renderPositionZones()}
       ${formation().slots.map(slotCard).join("")}
+      ${(motion?.rivals || []).map(renderRivalCard).join("")}
+      ${goalEffect}
+      ${duelEffect}
     </div>
     <div class="bench-row"><span>BENCH</span><div>${benchPlayers().map((item) => renderRosterCard(item, true)).join("")}</div></div>
   </section>`;
@@ -1887,7 +2361,8 @@ function renderDecisionLog(result, expanded = false) {
   if (!decisions.length) {
     return `<section class="decision-log empty"><div><span>COACH DECISIONS</span><b>경기 중 전술 변경 없음</b></div><p>이번 시뮬레이션은 킥오프 전 설정한 선발과 전술을 끝까지 유지했습니다.</p></section>`;
   }
-  return `<section class="decision-log ${expanded ? "expanded" : ""}"><div class="decision-heading"><span>COACH DECISIONS</span><b>감독 의사결정 로그</b></div><div class="decision-list">${decisions.map((event) => `<div class="decision-item ${event.type}"><time>${String(event.minute).padStart(2, "0")}′</time><i>${event.type === "sub" ? "SUB" : "TACTIC"}</i><div><p>${event.text}</p>${event.actualImpact ? `<small class="actual-impact">재계산 반영 ${event.actualImpact.map(([label, value]) => `${label} ${value >= 0 ? "+" : ""}${value}`).join(" · ")}</small>` : ""}</div></div>`).join("")}</div></section>`;
+  const tag = (event) => event.type === "sub" ? "SUB" : event.type === "decision" ? "KEEP" : "TACTIC";
+  return `<section class="decision-log ${expanded ? "expanded" : ""}"><div class="decision-heading"><span>COACH DECISIONS</span><b>감독 의사결정 로그</b></div><div class="decision-list">${decisions.map((event) => `<div class="decision-item ${event.type}"><time>${String(event.minute).padStart(2, "0")}′</time><i>${tag(event)}</i><div><p>${event.text}</p>${event.actualImpact ? `<small class="actual-impact">재계산 반영 ${event.actualImpact.map(([label, value]) => `${label} ${value >= 0 ? "+" : ""}${value}`).join(" · ")}</small>` : ""}</div></div>`).join("")}</div></section>`;
 }
 
 function tacticalReasonRows(result) {
@@ -2053,7 +2528,7 @@ function replanRemainingMatch() {
   const nextPhaseStart = nextPhaseStartAfter(live.minute);
   const staminaOverrides = Object.fromEntries((live.substitutions || []).map((substitution) => [substitution.inId, { minute: substitution.minute, stamina: substitution.stamina }]));
   const revised = calculateSimulation({ staminaOverrides });
-  const completedEvents = previous.events.filter((event) => event.minute <= live.minute && !["finish", "sub", "tactic"].includes(event.moment));
+  const completedEvents = previous.events.filter((event) => event.minute <= live.minute && !["finish", "sub", "tactic", "decision"].includes(event.moment));
   const adjustmentEvents = live.adjustmentEvents || [];
   let homeScore = live.homeScore;
   let awayScore = live.awayScore;
@@ -2069,7 +2544,7 @@ function replanRemainingMatch() {
   const events = [...completedEvents, ...adjustmentEvents, ...remainingEvents, {
     minute: 90, type: "finish", moment: "finish", team: "neutral", attackingTeam: "neutral", scoreHome: homeScore, scoreAway: awayScore,
     text: `FULL TIME · ${homeTeam().shortName} ${homeScore} - ${awayScore} ${awayTeam().shortName}`
-  }].sort((a, b) => a.minute - b.minute || (a.moment === "half" ? -1 : b.moment === "half" ? 1 : 0));
+  }].sort((a, b) => a.minute - b.minute || (a.moment === "checkpoint" ? -1 : b.moment === "checkpoint" ? 1 : 0));
   const phaseStats = [...(previous.phaseStats || []).filter((phase) => phase.end < nextPhaseStart), ...revised.phaseStats.filter((phase) => phase.end >= nextPhaseStart)];
   const phaseMetrics = [...previous.phaseMetrics.filter((phase) => phase.minute < nextPhaseStart), ...revised.phaseMetrics.filter((phase) => phase.minute >= nextPhaseStart)];
   const staminaTimeline = [...previous.staminaTimeline.filter((snapshot) => snapshot.minute < nextPhaseStart), ...revised.staminaTimeline.filter((snapshot) => snapshot.minute >= nextPhaseStart)];
@@ -2077,7 +2552,7 @@ function replanRemainingMatch() {
   const xgAway = phaseStats.reduce((sum, phase) => sum + phase.xgAway, 0);
   const finalStamina = staminaTimeline.at(-1)?.players || [];
   const lowStamina = finalStamina.filter((item) => item.stamina < 55).map((item) => player(item.id)).filter(Boolean);
-  const changeScope = live.minute === 45 ? "하프타임" : `${live.minute}분 경기 중`;
+  const changeScope = live.minute === 45 ? "하프타임 체크포인트" : `${live.minute}분 체크포인트`;
   state.result = {
     ...revised,
     homeScore, awayScore, events, phaseStats, phaseMetrics, staminaTimeline, xgHome: clamp(xgHome, .25, 4.2), xgAway: clamp(xgAway, .25, 4.1),
@@ -2087,16 +2562,16 @@ function replanRemainingMatch() {
     defense: Math.round(clamp(average(phaseMetrics.map((item) => item.defense)), 35, 95)),
     risk: Math.round(clamp(average(phaseMetrics.map((item) => item.risk)), 20, 92)),
     finalMetric: phaseMetrics.at(-1), lowStamina, decisionLog: adjustmentEvents,
-    effects: [...revised.effects, `${changeScope} 교체·전술 변경을 반영해 ${nextPhaseStart}분부터 결과를 재계산했습니다.`].slice(0, 4)
+    effects: [...revised.effects, `${changeScope}의 감독 판단을 반영해 ${nextPhaseStart}분부터 남은 구간을 재계산했습니다.`].slice(0, 4)
   };
   const chosenDecision = live.decisionReplay?.options.find((option) => option.id === live.decisionReplay?.chosenId);
   if (chosenDecision) {
-    state.result.decisionImpact = buildDecisionImpact(live.decisionReplay?.baseline, state.result, chosenDecision);
+    state.result.decisionImpact = buildDecisionImpact(live.decisionReplay?.baseline, state.result, chosenDecision, live.minute);
   }
   const baselinePhase = previous.phaseMetrics.find((phase) => phase.minute >= nextPhaseStart);
   const revisedPhase = state.result.phaseMetrics.find((phase) => phase.minute >= nextPhaseStart);
   if (baselinePhase && revisedPhase) {
-    (state.result.decisionLog || []).filter((event) => event.type === "sub" && event.impact).forEach((event) => {
+    (state.result.decisionLog || []).filter((event) => event.minute === live.minute && ["sub", "tactic", "decision"].includes(event.type)).forEach((event) => {
       event.actualImpact = [
         ["공격", revisedPhase.attack - baselinePhase.attack], ["점유", revisedPhase.possession - baselinePhase.possession],
         ["수비", revisedPhase.defense - baselinePhase.defense], ["위험", revisedPhase.risk - baselinePhase.risk]
@@ -2121,6 +2596,30 @@ function runSimulation() {
   state.resultViewOpen = false;
   state.rightPanelTab = "match";
   startPlayback();
+  focusMatchPitch();
+}
+
+function focusMatchPitch() {
+  // Rendering replaces the pitch node, so defer until the current render has
+  // committed.  Scroll and DOM focus deliberately target the same landmark.
+  window.requestAnimationFrame(() => {
+    const pitch = document.querySelector(".pitch-shell");
+    if (!pitch) return;
+    pitch.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+    pitch.focus({ preventScroll: true });
+  });
+}
+
+function focusLiveSubSelection(kind, playerId) {
+  // Player cards are recreated on every selection, so restore focus to the
+  // exact card the manager just clicked.  This keeps OUT and IN behaviour
+  // identical and makes the selected player unmistakable in a long list.
+  window.requestAnimationFrame(() => {
+    const target = document.querySelector(`[data-live-${kind}="${playerId}"]`);
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+    target.focus({ preventScroll: true });
+  });
 }
 
 function startPlaybackLegacy() {
@@ -2155,7 +2654,23 @@ function startPlaybackLegacy() {
 
 function schedulePlayback() {
   if (state.playbackTimer) window.clearInterval(state.playbackTimer);
-  state.playbackTimer = window.setInterval(advancePlayback, 1350);
+  state.playbackTimer = window.setInterval(advancePlayback, PLAYBACK_EVENT_DURATION);
+}
+
+function liveScoreForEvent(live, event) {
+  const eventHome = Number.isFinite(event?.scoreHome) ? event.scoreHome : live.homeScore;
+  const eventAway = Number.isFinite(event?.scoreAway) ? event.scoreAway : live.awayScore;
+  let home = Math.max(live.homeScore, eventHome);
+  let away = Math.max(live.awayScore, eventAway);
+  // Replanned sequences carry an accumulated score.  The explicit goal
+  // fallback also makes the live board resilient if a generated event has a
+  // missing or stale score snapshot.
+  if (event?.moment === "goal") {
+    if (event.team === "home") home = Math.max(home, live.homeScore + 1);
+    if (event.team === "away") away = Math.max(away, live.awayScore + 1);
+  }
+  const changed = home !== live.homeScore || away !== live.awayScore;
+  return { home, away, changed, team: event?.moment === "goal" ? event.team : null };
 }
 
 function startPlayback() {
@@ -2182,21 +2697,32 @@ function advancePlayback() {
     render();
     return;
   }
+  const score = liveScoreForEvent(live, event);
   const next = {
     ...live,
     eventIndex: live.eventIndex + 1,
     visibleEvents: [...live.visibleEvents, event],
     minute: event.minute,
-    homeScore: event.scoreHome,
-    awayScore: event.scoreAway,
+    homeScore: score.home,
+    awayScore: score.away,
+    scorePulse: score.changed && score.team ? { team: score.team, minute: event.minute } : null,
     activePlayerId: event.playerId,
     activeTeam: event.team,
     motion: buildEventMotion(event)
   };
-  if (event.moment === "half") {
+  if (event.moment === "checkpoint") {
     if (state.playbackTimer) window.clearInterval(state.playbackTimer);
     state.playbackTimer = null;
-    state.playback = { ...next, isPlaying: false, paused: true, breakKind: "half", activePlayerId: null, decisionReplay: createDecisionReplay(state.result) };
+    const checkpointReport = buildCheckpointAnalysis(state.result, event.minute);
+    state.playback = {
+      ...next,
+      isPlaying: false,
+      paused: true,
+      breakKind: "checkpoint",
+      activePlayerId: null,
+      checkpointReport,
+      decisionReplay: createDecisionReplay(state.result, event.minute)
+    };
   } else {
     state.playback = next;
   }
@@ -2208,7 +2734,11 @@ function resumePlayback() {
   if (state.playback.needsReplan) replanRemainingMatch();
   state.playback = { ...state.playback, isPlaying: true, paused: false, breakKind: null, activePlayerId: null, motion: null, pendingSubOut: null, pendingSubIn: null };
   render();
-  schedulePlayback();
+  focusMatchPitch();
+  // Start the next incident immediately. Waiting an entire scene interval
+  // after the manager clicks resume would make the match feel unresponsive.
+  advancePlayback();
+  if (state.playback?.isPlaying) schedulePlayback();
 }
 
 function openSubstitutionBreak() {
@@ -2223,7 +2753,10 @@ function liveStaminaSnapshot(result, minute) {
   const snapshot = result.staminaTimeline.find((item) => item.minute >= minute) || result.staminaTimeline[result.staminaTimeline.length - 1];
   if (!snapshot) return [];
   let players = [...snapshot.players];
-  if (state.playback?.replanned && minute >= 45) return players;
+  // Replanned timelines already contain the current XI and every applied
+  // substitution.  Applying the substitution list a second time would freeze
+  // an incoming player's fitness at the moment they entered.
+  if (state.playback?.replanned) return players;
   (state.playback?.substitutions || []).forEach((substitution) => {
     players = players.filter((item) => item.id !== substitution.outId && item.id !== substitution.inId);
     const incoming = player(substitution.inId);
@@ -2258,15 +2791,29 @@ function previewDirection(value, positiveIsGood = true) {
   return direction > 1 ? "↑" : direction < -1 ? "↓" : "→";
 }
 
+function renderCheckpointAnalysis(result) {
+  const live = state.playback;
+  const report = live?.checkpointReport || buildCheckpointAnalysis(result, live?.minute || 15);
+  if (!report) return "";
+  const phaseStats = report.stats;
+  const lineCard = (line) => {
+    const tone = line.id === report.strongest?.id ? "strong" : line.id === report.weakest?.id ? "weak" : "steady";
+    const leader = line.leader ? `${line.leader.item.name} ${line.leader.slot}` : "-";
+    const concern = line.concern ? `${line.concern.item.name} ${line.concern.slot}` : "-";
+    return `<article class="checkpoint-line ${tone}"><div><span>${line.id === report.strongest?.id ? "STRONG" : line.id === report.weakest?.id ? "WATCH" : "BALANCED"}</span><b>${line.label}</b></div><strong>${line.score}</strong><small>${line.slots}</small><p><em>강점</em>${leader}<br/><em>보강</em>${concern}</p></article>`;
+  };
+  return `<section class="checkpoint-analysis"><div class="checkpoint-heading"><div><span>15′ COACH BRIEFING</span><b>${report.minute}′ 구간 진단</b></div><strong>${report.priority.label}</strong></div><p class="checkpoint-flow">${report.flow}</p><div class="checkpoint-stats"><span><small>슈팅</small><b>${phaseStats.shotsHome}<i>:</i>${phaseStats.shotsAway}</b></span><span><small>유효 슈팅</small><b>${phaseStats.onTargetHome}<i>:</i>${phaseStats.onTargetAway}</b></span><span><small>xG</small><b>${phaseStats.xgHome.toFixed(1)}<i>:</i>${phaseStats.xgAway.toFixed(1)}</b></span><span><small>위험</small><b>${report.phase.risk}</b></span></div><div class="checkpoint-lines">${report.units.map(lineCard).join("")}</div><div class="checkpoint-recommendation"><span>${report.priority.label}</span><p>${report.priority.text}</p><small>강점 ${report.strongest?.label || "-"} ${report.strongest?.score || 0} · 보강 ${report.weakest?.label || "-"} ${report.weakest?.score || 0} · 취약 ${report.vulnerableSide?.side || "-"} ${report.vulnerableSide?.score || 0}</small></div></section>`;
+}
+
 function renderDecisionReplay() {
   const live = state.playback;
   const replay = live?.decisionReplay;
-  if (!live?.paused || live.breakKind !== "half" || !replay?.baseline) return "";
+  if (!live?.paused || !replay?.baseline) return "";
   const card = (option) => {
     const selected = replay.chosenId === option.id;
-    const attackDirection = previewDirection(option.preview.attack - replay.baseline.attack);
-    const defenseDirection = previewDirection(option.preview.defense - replay.baseline.defense);
-    const riskDirection = previewDirection(option.preview.risk - replay.baseline.risk, false);
+    const attackDirection = previewDirection(option.preview.attack - replay.phaseBaseline.attack);
+    const defenseDirection = previewDirection(option.preview.defense - replay.phaseBaseline.defense);
+    const riskDirection = previewDirection(option.preview.risk - replay.phaseBaseline.risk, false);
     return `<button class="decision-choice ${option.id} ${selected ? "selected" : ""}" data-decision-choice="${option.id}" aria-pressed="${selected}">
       <span class="decision-choice-top"><i>${option.shortLabel}</i><b>${option.label}</b>${selected ? "<em>선택됨</em>" : ""}</span>
       <strong>${option.goal}</strong>
@@ -2274,13 +2821,15 @@ function renderDecisionReplay() {
       <span class="decision-signals"><i>기회 <b>${attackDirection}</b></i><i>수비 <b>${defenseDirection}</b></i><i>위험 <b>${riskDirection}</b></i></span>
     </button>`;
   };
-  return `<section class="decision-replay"><div class="decision-replay-heading"><div><span>IF: COACH DECISION</span><b>45′, 당신이라면 어떻게 바꿀까요?</b></div><small>최종 점수·xG는 경기 종료 후 공개됩니다.</small></div><p>같은 전반 흐름에서 선택할 수 있는 후반 플랜입니다. 선택 후 교체와 전술 조정도 함께 적용할 수 있습니다.</p><div class="decision-choice-grid">${replay.options.map(card).join("")}</div></section>`;
+  const timing = replay.minute === 45 ? "하프타임, 후반 플랜을 선택하세요." : `${replay.minute}′, 다음 15분 플랜을 선택하세요.`;
+  return `<section class="decision-replay"><div class="decision-replay-heading"><div><span>IF: COACH DECISION</span><b>${timing}</b></div><small>선택한 전술은 다음 구간부터 재계산됩니다.</small></div><p>${replay.report?.summary || "라인별 흐름을 기준으로 유지·안정·균형·공격 전환을 비교하세요."}</p><div class="decision-choice-grid">${replay.options.map(card).join("")}</div></section>`;
 }
 
 function renderHalfTimeManagerBase(result) {
   const live = state.playback;
   if (!live?.paused) return "";
-  const isHalfTime = live.breakKind === "half";
+  const isCheckpoint = live.breakKind === "checkpoint";
+  const isHalfTime = isCheckpoint && live.minute === 45;
   const currentStates = liveStaminaSnapshot(result, live.minute);
   const staminaById = Object.fromEntries(currentStates.map((item) => [item.id, item.stamina]));
   const starters = sortSubstitutionPlayers(currentLineupPlayers(), true);
@@ -2298,14 +2847,17 @@ function renderHalfTimeManagerBase(result) {
     return `<button class="sub-card sub-${type} ${selected ? "selected" : ""}" ${dataAttribute} ${substitutionLimitReached ? "disabled" : ""}><span class="sub-card-top"><i>${isOut ? "OUT" : "IN"}</i><em>${substitutionPosition(item, isOut)}</em></span><b>${item.name}</b><small>${isOut ? "현재" : "투입"} 체력 ${stamina} · OVR ${item.overall}</small></button>`;
   };
   const comparison = outgoing && incoming
-    ? `<div class="sub-matchup-preview ready"><span>BENCH IMPACT LENS · 교체 미리보기</span><div><b class="outgoing">${outgoing.name}<small>${substitutionPosition(outgoing, true)} · 체력 ${impact.currentStamina}</small></b><i>→</i><b class="incoming">${incoming.name}<small>${impact.slot} 적합도 ${impact.fit} · 체력 ${impact.incomingStamina}</small></b></div><div class="sub-impact-deltas">${impact.deltas.map(([label, value]) => `<span class="${value >= 0 ? "good" : "warning"}"><small>${label}</small><b>${value >= 0 ? "+" : ""}${value}</b></span>`).join("")}</div><p>다음 전술 구간의 역할 기여도를 기준으로 계산한 예상 변화입니다.</p></div>`
-    : `<div class="sub-matchup-preview"><span>교체 미리보기</span><p>OUT 선수와 IN 선수를 한 명씩 선택하세요.</p></div>`;
+    ? `<div class="sub-matchup-preview ready" tabindex="-1"><span>BENCH IMPACT LENS · 교체 미리보기</span><div><b class="outgoing">${outgoing.name}<small>${substitutionPosition(outgoing, true)} · 체력 ${impact.currentStamina}</small></b><i>→</i><b class="incoming">${incoming.name}<small>${impact.slot} 적합도 ${impact.fit} · 체력 ${impact.incomingStamina}</small></b></div><div class="sub-impact-deltas">${impact.deltas.map(([label, value]) => `<span class="${value >= 0 ? "good" : "warning"}"><small>${label}</small><b>${value >= 0 ? "+" : ""}${value}</b></span>`).join("")}</div><p>다음 전술 구간의 역할 기여도를 기준으로 계산한 예상 변화입니다.</p></div>`
+    : `<div class="sub-matchup-preview" tabindex="-1"><span>교체 미리보기</span><p>OUT 선수와 IN 선수를 한 명씩 선택하세요.</p></div>`;
   const instruction = substitutionLimitReached
     ? "교체 5회를 모두 사용했습니다. 현재 전술을 확인한 뒤 경기를 재개하세요."
-    : isHalfTime
-      ? "ST부터 GK까지 포지션 순으로 선수를 확인하고, OUT / IN을 각각 선택해 교체를 적용하세요."
+    : isCheckpoint
+      ? "라인별 진단을 확인한 뒤 ST부터 GK까지 포지션 순으로 OUT / IN을 선택하세요. 적용한 교체와 전술은 다음 15분부터 결과에 반영됩니다."
       : "경기 흐름을 잠시 멈췄습니다. OUT / IN 선수를 선택하면 다음 전술 구간부터 결과가 재계산됩니다.";
-  return `<section class="half-time-manager"><div class="half-time-heading"><div><span>${isHalfTime ? "HALF TIME MANAGER" : "LIVE SUBSTITUTION"}</span><b>${live.minute}′ ${isHalfTime ? "라커룸 지시" : "경기 중 교체"}</b></div><strong>${homeTeam().shortName} ${live.homeScore} : ${live.awayScore} ${awayTeam().shortName}</strong></div><p>${instruction}</p><div class="sub-limit-status ${substitutionLimitReached ? "complete" : ""}"><span>SUBSTITUTIONS</span><b>${live.substitutions.length}<i>/</i>5</b><small>남은 교체 ${substitutionsLeft}회 · 교체 아웃 선수는 재투입할 수 없습니다.</small></div><div class="substitution-grid"><div class="sub-column sub-out-column"><div class="sub-column-heading"><span>SUB OUT</span><b>교체 아웃 · ST → GK</b></div><div class="sub-list">${starters.map((item) => playerCard(item, "out")).join("")}</div></div><div class="sub-column sub-in-column"><div class="sub-column-heading"><span>SUB IN</span><b>교체 인 · ST → GK</b></div><div class="sub-list">${bench.map((item) => playerCard(item, "in")).join("")}</div></div></div>${comparison}<div class="half-time-actions"><button class="apply-live-sub" data-apply-live-sub ${live.pendingSubOut && live.pendingSubIn && !substitutionLimitReached ? "" : "disabled"}>${substitutionLimitReached ? "교체 종료" : "교체 적용"} <small>${live.substitutions.length}/5</small></button><button class="resume-match" data-resume-match>${isHalfTime ? "후반 시작" : "경기 재개"} <span>▶</span></button></div></section>`;
+  const managerLabel = isCheckpoint ? (isHalfTime ? "HALF TIME CHECKPOINT" : "COACH CHECKPOINT") : "LIVE SUBSTITUTION";
+  const managerTitle = isCheckpoint ? `${live.minute}′ ${isHalfTime ? "라커룸 지시" : "15분 의사결정"}` : `${live.minute}′ 경기 중 교체`;
+  const resumeLabel = isCheckpoint ? (isHalfTime ? "후반 시작" : live.minute === 75 ? "마지막 15분 재개" : "다음 15분 재개") : "경기 재개";
+  return `<section class="half-time-manager checkpoint-manager ${isCheckpoint ? "is-checkpoint" : ""}"><div class="half-time-heading"><div><span>${managerLabel}</span><b>${managerTitle}</b></div><strong>${homeTeam().shortName} ${live.homeScore} : ${live.awayScore} ${awayTeam().shortName}</strong></div><p>${instruction}</p>${isCheckpoint ? renderCheckpointAnalysis(result) : ""}<div class="sub-limit-status ${substitutionLimitReached ? "complete" : ""}"><span>SUBSTITUTIONS</span><b>${live.substitutions.length}<i>/</i>5</b><small>남은 교체 ${substitutionsLeft}회 · 교체 아웃 선수는 재투입할 수 없습니다.</small></div><div class="substitution-grid"><div class="sub-column sub-out-column"><div class="sub-column-heading"><span>SUB OUT</span><b>교체 아웃 · ST → GK</b></div><div class="sub-list">${starters.map((item) => playerCard(item, "out")).join("")}</div></div><div class="sub-column sub-in-column"><div class="sub-column-heading"><span>SUB IN</span><b>교체 인 · ST → GK</b></div><div class="sub-list">${bench.map((item) => playerCard(item, "in")).join("")}</div></div></div>${comparison}<div class="half-time-actions"><button class="apply-live-sub" data-apply-live-sub ${live.pendingSubOut && live.pendingSubIn && !substitutionLimitReached ? "" : "disabled"}>${substitutionLimitReached ? "교체 종료" : "교체 적용"} <small>${live.substitutions.length}/5</small></button><button class="resume-match" data-resume-match>${resumeLabel} <span>▶</span></button></div></section>`;
 }
 
 function renderHalfTimeManager(result) {
@@ -2355,9 +2907,11 @@ function renderLiveMatch(result) {
   }
   const visible = live.visibleEvents.slice(-3).reverse();
   const status = live.paused ? "half-time" : live.isPlaying ? "playing" : "complete";
-  const heading = live.paused ? (live.breakKind === "half" ? "HALF TIME" : "MATCH PAUSED") : live.isPlaying ? "LIVE PLAYBACK" : "FULL TIME";
-  const control = live.paused ? `<span class="live-pause-tag">전술 조정 중</span>` : live.isPlaying ? `<div class="live-controls"><button class="live-substitute" data-open-sub-break>교체</button><button class="live-play" id="play-match">재시작</button></div>` : `<button class="live-play" id="play-match">다시 재생</button>`;
-  return `<section class="live-match ${status}"><div class="live-heading"><div><span>${heading}</span><b>${String(live.minute).padStart(2, "0")}′ 경기 흐름</b></div>${control}</div><div class="live-score"><b>${homeTeam().shortName}</b><strong>${live.homeScore}<i>:</i>${live.awayScore}</strong><b>${awayTeam().shortName}</b></div><div class="match-progress"><i style="--progress:${(live.minute / 90) * 100}%"></i></div><div class="live-events">${visible.map((event) => `<p class="${event.type}"><time>${String(event.minute).padStart(2, "0")}′</time>${event.text}</p>`).join("") || "<p>킥오프. 양 팀의 전술 간격을 확인하는 중입니다.</p>"}</div>${renderTacticalPulse(result, Math.max(15, live.minute))}${renderStaminaStrip(result, Math.max(15, live.minute))}${renderHalfTimeManager(result)}</section>`;
+  const heading = live.paused ? (live.breakKind === "checkpoint" ? "COACH CHECKPOINT" : "MATCH PAUSED") : live.isPlaying ? "LIVE PLAYBACK" : "FULL TIME";
+  const control = live.paused ? `<span class="live-pause-tag">${live.minute}′ 판단 중</span>` : live.isPlaying ? `<div class="live-controls"><button class="live-substitute" data-open-sub-break>교체</button><button class="live-play" id="play-match">재시작</button></div>` : `<button class="live-play" id="play-match">다시 재생</button>`;
+  const scorePulse = live.scorePulse?.team;
+  const scoreLabel = scorePulse === "home" ? `${homeTeam().shortName} GOAL` : scorePulse === "away" ? `${awayTeam().shortName} GOAL` : "";
+  return `<section class="live-match ${status}"><div class="live-heading"><div><span>${heading}</span><b>${String(live.minute).padStart(2, "0")}′ 경기 흐름</b></div>${control}</div><div class="live-score ${scorePulse ? `score-updated ${scorePulse}` : ""}"><b>${homeTeam().shortName}</b><strong>${live.homeScore}<i>:</i>${live.awayScore}</strong><b>${awayTeam().shortName}</b>${scoreLabel ? `<em>${scoreLabel}</em>` : ""}</div><div class="match-progress"><i style="--progress:${(live.minute / 90) * 100}%"></i></div><div class="live-events">${visible.map((event) => `<p class="${event.type}"><time>${String(event.minute).padStart(2, "0")}′</time>${event.text}</p>`).join("") || "<p>킥오프. 양 팀의 전술 간격을 확인하는 중입니다.</p>"}</div>${renderTacticalPulse(result, Math.max(15, live.minute))}${renderStaminaStrip(result, Math.max(15, live.minute))}${renderHalfTimeManager(result)}</section>`;
 }
 
 function renderResultSectionBase(includeLive = true) {
@@ -2366,7 +2920,7 @@ function renderResultSectionBase(includeLive = true) {
     return `<section class="results empty-results"><div class="result-placeholder-icon">◌</div><h2>전술 결과를 준비 중입니다</h2><p>선발, 전술, 상대 대응안을 구성한 뒤 시뮬레이션을 실행하면<br/>90분 경기 흐름과 역할·체력 영향을 확인할 수 있습니다.</p><div class="empty-hints"><span>선수 배치</span><i>→</i><span>상대 대응안</span><i>→</i><span>경기 재생</span></div></section>`;
   }
   if (!state.analysisRevealed) {
-    return `<section class="results analysis-locked"><div class="analysis-locked-note"><span>RESULTS LOCKED</span><h2>경기 종료 후 전술 분석을 공개합니다</h2><p>하프타임의 전술 변경과 교체까지 반영한 최종 결과만 보여드립니다.</p></div>${includeLive ? renderLiveMatch(result) : ""}</section>`;
+    return `<section class="results analysis-locked"><div class="analysis-locked-note"><span>RESULTS LOCKED</span><h2>경기 종료 후 전술 분석을 공개합니다</h2><p>15분 단위 감독 판단, 교체, 전술 변경까지 반영한 최종 결과만 보여드립니다.</p></div>${includeLive ? renderLiveMatch(result) : ""}</section>`;
   }
   return `<section class="results">
     <div class="result-heading"><div><span class="eyebrow">MATCH ENGINE RESULT</span><h2>전술 결과 분석</h2></div><div class="result-actions"><button class="export-report" data-export-report>↓ 리포트</button><button class="save-plan" data-save-plan ${state.savedPlans.length >= 2 ? "disabled" : ""}>${state.savedPlans.length >= 2 ? "비교안 2/2" : "+ 현재 안 저장"}</button></div></div>
@@ -2486,7 +3040,7 @@ function bindInteractions() {
     render();
   });
   document.querySelectorAll("[data-tactic]").forEach((element) => element.addEventListener("change", () => { const before = { ...state.tactics }; state.tactics[element.dataset.tactic] = element.value; state.coachAdvice = null; if (state.playback?.paused) { recordLiveTacticChange(before, state.tactics); render(); return; } state.result = null; clearPlayback(); render(); }));
-  document.querySelector("#simulate-button")?.addEventListener("click", () => { runSimulation(); document.querySelector(".results")?.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
+  document.querySelector("#simulate-button")?.addEventListener("click", runSimulation);
   document.querySelector("[data-share-config]")?.addEventListener("click", copyShareLink);
   document.querySelector("[data-open-methodology]")?.addEventListener("click", () => { state.methodologyOpen = true; render(); });
   document.querySelectorAll("[data-close-methodology]").forEach((element) => element.addEventListener("click", () => { state.methodologyOpen = false; render(); }));
@@ -2499,8 +3053,20 @@ function bindInteractions() {
   document.querySelectorAll("[data-squad-density]").forEach((element) => element.addEventListener("click", () => { state.squadDensity = element.dataset.squadDensity; render(); }));
   document.querySelectorAll("[data-right-tab]").forEach((element) => element.addEventListener("click", () => { state.rightPanelTab = element.dataset.rightTab; render(); }));
   document.querySelectorAll("[data-decision-choice]").forEach((element) => element.addEventListener("click", () => applyDecisionChoice(element.dataset.decisionChoice)));
-  document.querySelectorAll("[data-live-out]").forEach((element) => element.addEventListener("click", () => { if (!state.playback?.paused) return; state.playback = { ...state.playback, pendingSubOut: element.dataset.liveOut }; render(); }));
-  document.querySelectorAll("[data-live-in]").forEach((element) => element.addEventListener("click", () => { if (!state.playback?.paused) return; state.playback = { ...state.playback, pendingSubIn: element.dataset.liveIn }; render(); }));
+  document.querySelectorAll("[data-live-out]").forEach((element) => element.addEventListener("click", () => {
+    if (!state.playback?.paused) return;
+    const playerId = element.dataset.liveOut;
+    state.playback = { ...state.playback, pendingSubOut: playerId };
+    render();
+    focusLiveSubSelection("out", playerId);
+  }));
+  document.querySelectorAll("[data-live-in]").forEach((element) => element.addEventListener("click", () => {
+    if (!state.playback?.paused) return;
+    const playerId = element.dataset.liveIn;
+    state.playback = { ...state.playback, pendingSubIn: playerId };
+    render();
+    focusLiveSubSelection("in", playerId);
+  }));
   document.querySelector("[data-apply-live-sub]")?.addEventListener("click", applyLiveSubstitution);
   document.querySelector("[data-resume-match]")?.addEventListener("click", resumePlayback);
   document.querySelector("[data-open-sub-break]")?.addEventListener("click", openSubstitutionBreak);
